@@ -25,11 +25,13 @@
 
 #define VMA_IMPLEMENTATION
 
+#include <fstream>
+#include <string>
+
 #include "shaders/host_device.h"
 #include "rayquery.hpp"
 #include "rtx_pipeline.hpp"
 #include "sample_example.hpp"
-#include "sample_gui.hpp"
 #include "tools.hpp"
 
 #include "nvml_monitor.hpp"
@@ -47,11 +49,14 @@ NvmlMonitor g_nvml(100, 100);
 void SampleExample::setup(const VkInstance&               instance,
                           const VkDevice&                 device,
                           const VkPhysicalDevice&         physicalDevice,
-                          const std::vector<nvvk::Queue>& queues)
-{
-  AppBaseVk::setup(instance, device, physicalDevice, queues[eGCT0].familyIndex);
+                          const std::vector<nvvk::Queue>& queues,
+                          uint32_t width,
+                          uint32_t height,
+                          VkFormat colorFormat /*= VK_FORMAT_B8G8R8A8_UNORM*/,
+                          VkFormat depthFormat /*= VK_FORMAT_UNDEFINED*/)
 
-  m_gui = std::make_shared<SampleGUI>(this);  // GUI of this class
+{
+  HeadlessAppVK::setup(instance, device, physicalDevice, queues[eGCT0].familyIndex, width, height, colorFormat, depthFormat);
 
   // Memory allocator for buffers and images
   m_alloc.init(instance, device, physicalDevice);
@@ -109,86 +114,15 @@ void SampleExample::loadEnvironmentHdr(const std::string& hdrFilename)
 
 
 //--------------------------------------------------------------------------------------------------
-// Loading asset in a separate thread
-// - Used by file drop and menu operation
-// Marking the session as busy, to avoid calling rendering while loading assets
-//
-void SampleExample::loadAssets(const char* filename)
-{
-  std::string sfile = filename;
-
-  // Need to stop current rendering
-  m_busy = true;
-  vkDeviceWaitIdle(m_device);
-
-  std::thread([&, sfile]() {
-    LOGI("Loading: %s\n", sfile.c_str());
-
-    // Supporting only GLTF and HDR files
-    namespace fs          = std::filesystem;
-    std::string extension = fs::path(sfile).extension().string();
-    if(extension == ".gltf" || extension == ".glb")
-    {
-      m_busyReasonText = "Loading scene ";
-
-      // Loading scene and creating acceleration structure
-      loadScene(sfile);
-      // Loading the scene might have loaded new textures, which is changing the number of elements
-      // in the DescriptorSetLayout. Therefore, the PipelineLayout will be out-of-date and need
-      // to be re-created. If they are re-created, the pipeline also need to be re-created.
-      m_pRender[m_rndMethod]->create(
-          m_size, {m_accelStruct.getDescLayout(), m_offscreen.getDescLayout(), m_scene.getDescLayout(), m_descSetLayout}, &m_scene);
-    }
-
-    if(extension == ".hdr")  //|| extension == ".exr")
-    {
-      m_busyReasonText = "Loading HDR ";
-      loadEnvironmentHdr(sfile);
-      updateHdrDescriptors();
-    }
-
-
-    // Re-starting the frame count to 0
-    SampleExample::resetFrame();
-    m_busy = false;
-  }).detach();
-}
-
-
-//--------------------------------------------------------------------------------------------------
 // Called at each frame to update the UBO: scene, camera, environment (sun&sky)
 //
 void SampleExample::updateUniformBuffer(const VkCommandBuffer& cmdBuf)
 {
-  if(m_busy)
-    return;
-
   LABEL_SCOPE_VK(cmdBuf);
   const float aspectRatio = m_renderRegion.extent.width / static_cast<float>(m_renderRegion.extent.height);
 
   m_scene.updateCamera(cmdBuf, aspectRatio);
   vkCmdUpdateBuffer(cmdBuf, m_sunAndSkyBuffer.buffer, 0, sizeof(SunAndSky), &m_sunAndSky);
-}
-
-//--------------------------------------------------------------------------------------------------
-// If the camera matrix has changed, resets the frame otherwise, increments frame.
-//
-void SampleExample::updateFrame()
-{
-  static nvmath::mat4f refCamMatrix;
-  static float         fov = 0;
-
-  auto& m = CameraManip.getMatrix();
-  auto  f = CameraManip.getFov();
-  if(memcmp(&refCamMatrix.a00, &m.a00, sizeof(nvmath::mat4f)) != 0 || f != fov)
-  {
-    resetFrame();
-    refCamMatrix = m;
-    fov          = f;
-  }
-
-  if(m_rtxState.frame < m_maxFrames)
-    m_rtxState.frame++;
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -270,7 +204,6 @@ void SampleExample::destroyResources()
   m_accelStruct.destroy();
   m_offscreen.destroy();
   m_skydome.destroy();
-  m_axis.deinit();
 
   // All renderers
   for(auto p : m_pRender)
@@ -282,32 +215,6 @@ void SampleExample::destroyResources()
   // Memory
   m_alloc.deinit();
 }
-
-//--------------------------------------------------------------------------------------------------
-// Handling resize of the window
-//
-void SampleExample::onResize(int /*w*/, int /*h*/)
-{
-  m_offscreen.update(m_size);
-  resetFrame();
-}
-
-//--------------------------------------------------------------------------------------------------
-// Call the rendering of all graphical user interface
-//
-void SampleExample::renderGui(nvvk::ProfilerVK& profiler)
-{
-  m_gui->titleBar();
-  m_gui->menuBar();
-  m_gui->render(profiler);
-
-  auto& IO = ImGui::GetIO();
-  if(ImGui::IsMouseDoubleClicked(ImGuiDir_Left) && !ImGui::GetIO().WantCaptureKeyboard)
-  {
-    screenPicking();
-  }
-}
-
 
 //--------------------------------------------------------------------------------------------------
 // Creating the render: RTX, Ray Query, ...
@@ -346,7 +253,6 @@ void SampleExample::setRenderRegion(const VkRect2D& size)
 void SampleExample::createOffscreenRender()
 {
   m_offscreen.create(m_size, m_renderPass);
-  m_axis.init(m_device, m_renderPass, 0, 50.0f);
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -364,16 +270,15 @@ void SampleExample::drawPost(VkCommandBuffer cmdBuf)
                       static_cast<float>(m_size.height),
                       0.0f,
                       1.0f};
-  VkRect2D   scissor{m_renderRegion.offset, {m_renderRegion.extent.width, m_renderRegion.extent.height}};
+  VkRect2D   scissor{};
+  scissor.extent = {m_size.width, m_size.height};
   vkCmdSetViewport(cmdBuf, 0, 1, &viewport);
   vkCmdSetScissor(cmdBuf, 0, 1, &scissor);
 
   m_offscreen.m_tonemapper.zoom           = m_descaling ? 1.0f / m_descalingLevel : 1.0f;
-  m_offscreen.m_tonemapper.renderingRatio = size / area;
+  m_offscreen.m_tonemapper.renderingRatio = 1.0f;
   m_offscreen.run(cmdBuf);
 
-  if(m_showAxis)
-    m_axis.display(cmdBuf, CameraManip.getMatrix(), m_size);
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -385,12 +290,6 @@ void SampleExample::renderScene(const VkCommandBuffer& cmdBuf, nvvk::ProfilerVK&
 #if defined(NVP_SUPPORTS_NVML)
   g_nvml.refresh();
 #endif
-
-  if(m_busy)
-  {
-    m_gui->showBusyWindow();  // Busy while loading scene
-    return;
-  }
 
   LABEL_SCOPE_VK(cmdBuf);
 
@@ -405,7 +304,7 @@ void SampleExample::renderScene(const VkCommandBuffer& cmdBuf, nvvk::ProfilerVK&
   if(m_descaling)
     render_size = VkExtent2D{render_size.width / m_descalingLevel, render_size.height / m_descalingLevel};
 
-  m_rtxState.size = {render_size.width, render_size.height};
+  m_rtxState.size = {m_size.width, m_size.height};
   // State is the push constant structure
   m_pRender[m_rndMethod]->setPushContants(m_rtxState);
   // Running the renderer
@@ -421,121 +320,176 @@ void SampleExample::renderScene(const VkCommandBuffer& cmdBuf, nvvk::ProfilerVK&
   }
 }
 
-
-//////////////////////////////////////////////////////////////////////////
-// Keyboard / Drag and Drop
-//////////////////////////////////////////////////////////////////////////
-
-//--------------------------------------------------------------------------------------------------
-// Overload keyboard hit
-// - Home key: fit all, the camera will move to see the entire scene bounding box
-// - Space: Trigger ray picking and set the interest point at the intersection
-//          also return all information under the cursor
-//
-void SampleExample::onKeyboard(int key, int scancode, int action, int mods)
+void insertImageMemoryBarrier(
+  VkCommandBuffer cmdbuffer,
+  VkImage image,
+  VkAccessFlags srcAccessMask,
+  VkAccessFlags dstAccessMask,
+  VkImageLayout oldImageLayout,
+  VkImageLayout newImageLayout,
+  VkPipelineStageFlags srcStageMask,
+  VkPipelineStageFlags dstStageMask,
+  VkImageSubresourceRange subresourceRange)
 {
-  nvvk::AppBaseVk::onKeyboard(key, scancode, action, mods);
+  VkImageMemoryBarrier imageMemoryBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  imageMemoryBarrier.srcAccessMask = srcAccessMask;
+  imageMemoryBarrier.dstAccessMask = dstAccessMask;
+  imageMemoryBarrier.oldLayout = oldImageLayout;
+  imageMemoryBarrier.newLayout = newImageLayout;
+  imageMemoryBarrier.image = image;
+  imageMemoryBarrier.subresourceRange = subresourceRange;
 
-  if(action == GLFW_RELEASE)
-    return;
-
-  switch(key)
-  {
-    case GLFW_KEY_HOME:
-    case GLFW_KEY_F:  // Set the camera as to see the model
-      fitCamera(m_scene.getScene().m_dimensions.min, m_scene.getScene().m_dimensions.max, false);
-      break;
-    case GLFW_KEY_SPACE:
-      screenPicking();
-      break;
-    case GLFW_KEY_R:
-      resetFrame();
-      break;
-    default:
-      break;
-  }
+  vkCmdPipelineBarrier(
+    cmdbuffer,
+    srcStageMask,
+    dstStageMask,
+    0,
+    0, nullptr,
+    0, nullptr,
+    1, &imageMemoryBarrier);
 }
 
-//--------------------------------------------------------------------------------------------------
-//
-//
-void SampleExample::screenPicking()
+void SampleExample::dumpImage()
 {
-  double x, y;
-  glfwGetCursorPos(m_window, &x, &y);
-
-  // Set the camera as to see the model
-  nvvk::CommandPool sc(m_device, m_graphicsQueueIndex);
-  VkCommandBuffer   cmdBuf = sc.createCommandBuffer();
-
-  const float aspectRatio = m_renderRegion.extent.width / static_cast<float>(m_renderRegion.extent.height);
-  const auto& view        = CameraManip.getMatrix();
-  auto        proj        = nvmath::perspectiveVK(CameraManip.getFov(), aspectRatio, 0.1f, 1000.0f);
-
-  nvvk::RayPickerKHR::PickInfo pickInfo;
-  pickInfo.pickX          = float(x - m_renderRegion.offset.x) / float(m_renderRegion.extent.width);
-  pickInfo.pickY          = float(y - m_renderRegion.offset.y) / float(m_renderRegion.extent.height);
-  pickInfo.modelViewInv   = nvmath::invert(view);
-  pickInfo.perspectiveInv = nvmath::invert(proj);
-
-
-  m_picker.run(cmdBuf, pickInfo);
-  sc.submitAndWait(cmdBuf);
-
-  nvvk::RayPickerKHR::PickResult pr = m_picker.getResult();
-
-  if(pr.instanceID == ~0)
+	/*
+			Copy framebuffer image to host visible image
+	*/
+  const char* imagedata;
   {
-    LOGI("Nothing Hit\n");
-    return;
-  }
+    // Create the linear tiled destination image to copy to and to read the memory from
+    VkImageCreateInfo imgCreateInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    imgCreateInfo.imageType = VK_IMAGE_TYPE_2D;
+    imgCreateInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imgCreateInfo.extent.width = m_size.width;
+    imgCreateInfo.extent.height = m_size.height;
+    imgCreateInfo.extent.depth = 1;
+    imgCreateInfo.arrayLayers = 1;
+    imgCreateInfo.mipLevels = 1;
+    imgCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imgCreateInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imgCreateInfo.tiling = VK_IMAGE_TILING_LINEAR;
+    imgCreateInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    // Create the image
+    VkImage dstImage;
+    vkCreateImage(m_device, &imgCreateInfo, nullptr, &dstImage);
+    // Create memory to back up the image
+    VkMemoryRequirements memRequirements;
+    VkMemoryAllocateInfo memAllocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    VkDeviceMemory dstImageMemory;
+    vkGetImageMemoryRequirements(m_device, dstImage, &memRequirements);
+    memAllocInfo.allocationSize = memRequirements.size;
+    // Memory must be host visible to copy from
+    memAllocInfo.memoryTypeIndex = getMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    vkAllocateMemory(m_device, &memAllocInfo, nullptr, &dstImageMemory);
+    vkBindImageMemory(m_device, dstImage, dstImageMemory, 0);
 
-  nvmath::vec3f worldPos = pr.worldRayOrigin + pr.worldRayDirection * pr.hitT;
-  // Set the interest position
-  nvmath::vec3f eye, center, up;
-  CameraManip.getLookat(eye, center, up);
-  CameraManip.setLookat(eye, worldPos, up, false);
+    // Do the actual blit from the offscreen image to our host visible destination image
+    VkCommandBufferAllocateInfo cmdBufAllocateInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cmdBufAllocateInfo.commandPool        = m_cmdPool;
+    cmdBufAllocateInfo.commandBufferCount = 1;
+    cmdBufAllocateInfo.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+
+    VkCommandBuffer copyCmd;
+    vkAllocateCommandBuffers(m_device, &cmdBufAllocateInfo, &copyCmd);
+    VkCommandBufferBeginInfo cmdBufInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};;
+    vkBeginCommandBuffer(copyCmd, &cmdBufInfo);
+
+    // Transition destination image to transfer destination layout
+    insertImageMemoryBarrier(
+    	copyCmd,
+    	dstImage,
+    	0,
+    	VK_ACCESS_TRANSFER_WRITE_BIT,
+    	VK_IMAGE_LAYOUT_UNDEFINED,
+    	VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    	VK_PIPELINE_STAGE_TRANSFER_BIT,
+    	VK_PIPELINE_STAGE_TRANSFER_BIT,
+    	VkImageSubresourceRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 });
+
+    // colorAttachment.image is already in VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, and does not need to be transitioned
+
+    VkImageCopy imageCopyRegion{};
+    imageCopyRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    imageCopyRegion.srcSubresource.layerCount = 1;
+    imageCopyRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    imageCopyRegion.dstSubresource.layerCount = 1;
+    imageCopyRegion.extent.width = m_size.width;
+    imageCopyRegion.extent.height = m_size.height;
+    imageCopyRegion.extent.depth = 1;
+
+    vkCmdCopyImage(
+      copyCmd,
+      m_colorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      1,
+      &imageCopyRegion);
+
+    // // Transition destination image to general layout, which is the required layout for mapping the image memory later on
+    insertImageMemoryBarrier(
+    	copyCmd,
+    	dstImage,
+    	VK_ACCESS_TRANSFER_WRITE_BIT,
+    	VK_ACCESS_MEMORY_READ_BIT,
+    	VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    	VK_IMAGE_LAYOUT_GENERAL,
+    	VK_PIPELINE_STAGE_TRANSFER_BIT,
+    	VK_PIPELINE_STAGE_TRANSFER_BIT,
+    	VkImageSubresourceRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 });
+
+    vkEndCommandBuffer(copyCmd);
+
+    submitWork(copyCmd);
+
+    // Get layout of the image (including row pitch)
+    VkImageSubresource subResource{};
+    subResource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    VkSubresourceLayout subResourceLayout;
+
+    vkGetImageSubresourceLayout(m_device, dstImage, &subResource, &subResourceLayout);
+
+    // Map image memory so we can start copying from it
+    vkMapMemory(m_device, dstImageMemory, 0, VK_WHOLE_SIZE, 0, (void**)&imagedata);
+    imagedata += subResourceLayout.offset;
+
+    /*
+      Save host visible framebuffer image to disk (ppm format)
+    */
 
 
-  auto& prim = m_scene.getScene().m_primMeshes[pr.instanceCustomIndex];
-  LOGI("Hit(%d): %s\n", pr.instanceCustomIndex, prim.name.c_str());
-  LOGI(" - PrimId(%d)\n", pr.primitiveID);
-}
+    const char* filename = "headless.ppm";
 
-//--------------------------------------------------------------------------------------------------
-//
-//
-void SampleExample::onFileDrop(const char* filename)
-{
-  loadAssets(filename);
-}
+    std::ofstream file(filename, std::ios::out | std::ios::binary);
 
-//--------------------------------------------------------------------------------------------------
-// Window callback when the mouse move
-// - Handling ImGui and a default camera
-//
-void SampleExample::onMouseMotion(int x, int y)
-{
-  AppBaseVk::onMouseMotion(x, y);
+    // ppm header
+    file << "P6\n" << m_size.width << "\n" << m_size.height << "\n" << 255 << "\n";
 
-  if(ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().WantCaptureKeyboard)
-    return;
+    std::vector<VkFormat> formatsBGR = { VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SNORM };
+    bool colorSwizzle = (std::find(formatsBGR.begin(), formatsBGR.end(), VK_FORMAT_R8G8B8A8_UNORM) != formatsBGR.end());
+    colorSwizzle = true;
+    
+    // ppm binary pixel data
+    for (int32_t y = 0; y < m_size.height; y++) {
+      unsigned int *row = (unsigned int*)imagedata;
+      for (int32_t x = 0; x < m_size.width; x++) {
+        if (colorSwizzle) {
+          file.write((char*)row + 2, 1);
+          file.write((char*)row + 1, 1);
+          file.write((char*)row, 1);
+        }
+        else {
+          file.write((char*)row, 3);
+        }
+        row++;
+      }
+      imagedata += subResourceLayout.rowPitch;
+    }
+    file.close();
 
-  if(m_inputs.lmb || m_inputs.rmb || m_inputs.mmb)
-  {
-    m_descaling = true;
-  }
-}
+    LOGI("Framebuffer image saved to %s\n", filename);
 
-//--------------------------------------------------------------------------------------------------
-//
-//
-void SampleExample::onMouseButton(int button, int action, int mods)
-{
-  AppBaseVk::onMouseButton(button, action, mods);
-  if((m_inputs.lmb || m_inputs.rmb || m_inputs.mmb) == false && action == GLFW_RELEASE && m_descaling == true)
-  {
-    m_descaling = false;
-    resetFrame();
+    // Clear buffers
+    vkDestroyImage(m_device, dstImage, nullptr);
+    vkFreeMemory(m_device, dstImageMemory, nullptr);
+    vkFreeCommandBuffers(m_device, m_cmdPool, 1, &copyCmd);
   }
 }

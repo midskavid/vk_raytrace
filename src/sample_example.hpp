@@ -55,33 +55,21 @@ typedef nvvk::ResourceAllocatorDedicated Allocator;
 #define CPP  // For sun_and_sky
 
 #include "nvh/gltfscene.hpp"
-#include "nvvk/appbase_vk.hpp"
 #include "nvvk/debug_util_vk.hpp"
 #include "nvvk/profiler_vk.hpp"
 #include "nvvk/raytraceKHR_vk.hpp"
 #include "nvvk/raypicker_vk.hpp"
 
+#include "headless_vk.hpp"
 #include "accelstruct.hpp"
 #include "render_output.hpp"
 #include "scene.hpp"
 #include "shaders/host_device.h"
 
-#include "imgui_internal.h"
 #include "queue.hpp"
 
-class SampleGUI;
-
-//--------------------------------------------------------------------------------------------------
-// Simple rasterizer of OBJ objects
-// - Each OBJ loaded are stored in an `ObjModel` and referenced by a `ObjInstance`
-// - It is possible to have many `ObjInstance` referencing the same `ObjModel`
-// - Rendering is done in an offscreen framebuffer
-// - The image of the framebuffer is displayed in post-process in a full-screen quad
-//
-class SampleExample : public nvvk::AppBaseVk
+class SampleExample : public HeadlessAppVK
 {
-  friend SampleGUI;
-
 public:
   enum RndMethod
   {
@@ -98,34 +86,24 @@ public:
     eTransfer
   };
 
+  void setup(const VkInstance& instance, const VkDevice& device, const VkPhysicalDevice& physicalDevice, const std::vector<nvvk::Queue>& queues, uint32_t width, uint32_t height, VkFormat colorFormat = VK_FORMAT_B8G8R8A8_UNORM, VkFormat depthFormat = VK_FORMAT_UNDEFINED);
 
-  void setup(const VkInstance& instance, const VkDevice& device, const VkPhysicalDevice& physicalDevice, const std::vector<nvvk::Queue>& queues);
-
-  bool isBusy() { return m_busy; }
   void createDescriptorSetLayout();
   void createUniformBuffer();
   void destroyResources();
   void loadAssets(const char* filename);
   void loadEnvironmentHdr(const std::string& hdrFilename);
   void loadScene(const std::string& filename);
-  void onFileDrop(const char* filename) override;
-  void onKeyboard(int key, int scancode, int action, int mods) override;
-  void onMouseButton(int button, int action, int mods) override;
-  void onMouseMotion(int x, int y) override;
-  void onResize(int /*w*/, int /*h*/) override;
-  void renderGui(nvvk::ProfilerVK& profiler);
   void createRender(RndMethod method);
   void resetFrame();
-  void screenPicking();
-  void updateFrame();
   void updateHdrDescriptors();
   void updateUniformBuffer(const VkCommandBuffer& cmdBuf);
+  void dumpImage();
 
   Scene              m_scene;
   AccelStructure     m_accelStruct;
   RenderOutput       m_offscreen;
   HdrSampling        m_skydome;
-  nvvk::AxisVK       m_axis;
   nvvk::RayPickerKHR m_picker;
 
   // It is possible that ray query isn't supported (ex. Titan)
@@ -196,9 +174,4 @@ public:
   bool        m_showAxis{true};
   bool        m_descaling{false};
   int         m_descalingLevel{1};
-  bool        m_busy{false};
-  std::string m_busyReasonText;
-
-
-  std::shared_ptr<SampleGUI> m_gui;
 };
